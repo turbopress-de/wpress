@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/turbopress-de/wpress/archive"
 )
@@ -128,11 +129,10 @@ func cmdExtract(args []string, stdout, stderr io.Writer) int {
 
 	if !*force {
 		if empty, err := dirEmptyOrMissing(*out); err != nil {
-			fmt.Fprintln(stderr, "wpress:", err)
-			return 1
+			return fail(stdout, stderr, *asJSON, nil, 0, err)
 		} else if !empty {
-			fmt.Fprintf(stderr, "wpress: output directory %q is not empty (use -force)\n", *out)
-			return 1
+			return fail(stdout, stderr, *asJSON, nil, 0,
+				fmt.Errorf("output directory %q is not empty (use -force)", *out))
 		}
 	}
 
@@ -237,10 +237,12 @@ func cmdList(args []string, stdout, stderr io.Writer) int {
 // printable quotes paths that are not plain printable UTF-8, so file names
 // from untrusted archives cannot inject terminal escape sequences.
 func printable(p string) string {
-	if strconv.CanBackquote(p) && !strings.ContainsRune(p, '`') {
-		return p
+	for _, r := range p {
+		if !unicode.IsPrint(r) || unicode.Is(unicode.Bidi_Control, r) || r == '"' || r == '`' {
+			return strconv.QuoteToASCII(p)
+		}
 	}
-	return strconv.Quote(p)
+	return p
 }
 
 func printStats(w io.Writer, st *archive.Stats, d time.Duration, asJSON bool) {

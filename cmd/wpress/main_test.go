@@ -113,3 +113,27 @@ func TestUsageErrors(t *testing.T) {
 		}
 	}
 }
+
+func TestPrintableQuotesBidiAndC1(t *testing.T) {
+	for _, p := range []string{"evil\u202etxt.exe", "a\u009bb", "x\"y"} {
+		if got := printable(p); got == p {
+			t.Errorf("printable(%q) not quoted", p)
+		}
+	}
+	if got := printable("uploads/2024/bild-\u00e4.jpg"); got != "uploads/2024/bild-\u00e4.jpg" {
+		t.Errorf("plain umlaut quoted: %s", got)
+	}
+}
+
+func TestNotEmptyDirJSON(t *testing.T) {
+	a := writeArchive(t, true, entry(".", "x", []byte("x")))
+	out := t.TempDir()
+	os.WriteFile(filepath.Join(out, "existing"), nil, 0o644)
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"extract", "-json", "-o", out, a}, &stdout, &stderr); code != 1 {
+		t.Fatalf("exit %d", code)
+	}
+	if !strings.Contains(stdout.String(), `"error":"output directory`) {
+		t.Fatalf("stdout %q", stdout.String())
+	}
+}

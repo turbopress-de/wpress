@@ -169,6 +169,7 @@ func TestSafePathRejects(t *testing.T) {
 		{"x\ry", "a"},
 		{".", "\x1b[31mred"},
 		{".", "del\x7f"},
+		{".", "c1\u009b31m"},
 	}
 	for _, b := range bad {
 		if p, err := SafePath(b.prefix, b.name); !errors.Is(err, ErrUnsafePath) {
@@ -408,6 +409,20 @@ func TestExcludePatternNormalised(t *testing.T) {
 	for _, pat := range []string{"./updraft", "updraft/", "/updraft//"} {
 		if _, ok := Excluded("updraft/a.zip", []string{pat}); !ok {
 			t.Errorf("pattern %q should exclude updraft/a.zip", pat)
+		}
+	}
+}
+
+func TestEncryptedTruthyValues(t *testing.T) {
+	cases := map[string]bool{
+		`{"Encrypted":true}`: true, `{"Encrypted":1}`: true, `{"Encrypted":"1"}`: true,
+		`{"Encrypted":"yes"}`: true, `{"Encrypted":false}`: false, `{"Encrypted":0}`: false,
+		`{"Encrypted":"0"}`: false, `{"Encrypted":"false"}`: false, `{"Encrypted":""}`: false,
+		`{"EncryptedSignature":"x"}`: false, `not json`: false,
+	}
+	for in, want := range cases {
+		if got := encrypted([]byte(in)); got != want {
+			t.Errorf("encrypted(%s) = %v, want %v", in, got, want)
 		}
 	}
 }

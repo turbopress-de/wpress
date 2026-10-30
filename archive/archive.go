@@ -100,8 +100,9 @@ func (rd *Reader) Next() (*Header, error) {
 	if rd.done {
 		return nil, io.EOF
 	}
+	end := rd.offset + rd.remaining
 	if err := rd.skip(rd.remaining); err != nil {
-		return nil, fmt.Errorf("entry content ending at offset %d: %w", rd.offset+rd.remaining, err)
+		return nil, fmt.Errorf("entry content ending at offset %d: %w", end, err)
 	}
 	rd.remaining = 0
 
@@ -160,8 +161,10 @@ func (rd *Reader) checkTrailing() error {
 		return io.EOF
 	}
 	var b [1]byte
-	if n, _ := io.ReadFull(rd.r, b[:]); n > 0 {
+	if n, err := io.ReadFull(rd.r, b[:]); n > 0 {
 		return fmt.Errorf("data after the end marker at offset %d: archive is damaged", rd.offset-HeaderSize)
+	} else if err != io.EOF {
+		return err
 	}
 	return io.EOF
 }
@@ -242,8 +245,10 @@ func SafePath(prefix, name string) (string, error) {
 	if prefix != "" {
 		joined = prefix + "/" + name
 	}
-	for _, c := range []byte(joined) {
-		if c < 0x20 || c == 0x7f {
+	for _, r := range joined {
+		// C0, DEL and C1 controls (U+0080-U+009F can act as escape
+		// sequences in terminals). Invalid UTF-8 decodes to U+FFFD and passes.
+		if r < 0x20 || (r >= 0x7f && r <= 0x9f) {
 			return "", fmt.Errorf("%w: control character in %q", ErrUnsafePath, joined)
 		}
 	}

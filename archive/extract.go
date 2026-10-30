@@ -155,11 +155,31 @@ func Extract(rd *Reader, dir string, opt Options) (*Stats, error) {
 	return st, nil
 }
 
+// encrypted reports whether package.json marks the archive as encrypted.
+// Anything truthy counts (true, non-zero number, non-empty string other than
+// "0"/"false"); a bare EncryptedSignature, written by current plugin
+// versions for every archive, does not.
 func encrypted(packageJSON []byte) bool {
 	var cfg struct {
-		Encrypted bool `json:"Encrypted"`
+		Encrypted json.RawMessage `json:"Encrypted"`
 	}
-	return json.Unmarshal(packageJSON, &cfg) == nil && cfg.Encrypted
+	if json.Unmarshal(packageJSON, &cfg) != nil || len(cfg.Encrypted) == 0 {
+		return false
+	}
+	var v any
+	if json.Unmarshal(cfg.Encrypted, &v) != nil {
+		return false
+	}
+	switch x := v.(type) {
+	case bool:
+		return x
+	case float64:
+		return x != 0
+	case string:
+		x = strings.ToLower(strings.TrimSpace(x))
+		return x != "" && x != "0" && x != "false"
+	}
+	return false
 }
 
 func writeEntry(root *os.Root, h *Header, src io.Reader, buf []byte) error {
