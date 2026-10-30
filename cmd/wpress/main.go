@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -33,6 +35,22 @@ var BackupDirs = []string{
 	"uploads/backupbuddy_backups",
 	"backupwordpress-*",
 	"uploads/backupwordpress-*",
+}
+
+// parseInterspersed parses flags that may appear before or after
+// positional arguments and returns the positional ones.
+func parseInterspersed(fs *flag.FlagSet, args []string) ([]string, error) {
+	var pos []string
+	for {
+		if err := fs.Parse(args); err != nil {
+			return nil, err
+		}
+		if fs.NArg() == 0 {
+			return pos, nil
+		}
+		pos = append(pos, fs.Arg(0))
+		args = fs.Args()[1:]
+	}
 }
 
 type multiFlag []string
@@ -87,13 +105,15 @@ func cmdExtract(args []string, stdout, stderr io.Writer) int {
 	skipBackups := fs.Bool("skip-backups", false,
 		"skip backup folders of common backup plugins:\n"+strings.Join(BackupDirs, ", "))
 	asJSON := fs.Bool("json", false, "print the summary as JSON")
-	quiet := fs.Bool("q", false, "no progress output")
+	quiet := fs.Bool("q", false, "no progress output (it is only shown on a terminal anyway)")
+	allowTrunc := fs.Bool("allow-missing-eof", false, "accept archives without end marker (probably truncated)")
 	var excludes multiFlag
 	fs.Var(&excludes, "exclude", "skip entries whose path or parent directory matches `pattern`\n(path.Match syntax, repeatable), e.g. -exclude updraft")
-	if err := fs.Parse(args); err != nil {
+	pos, err := parseInterspersed(fs, args)
+	if err != nil {
 		return 2
 	}
-	if fs.NArg() != 1 || *out == "" {
+	if len(pos) != 1 || *out == "" {
 		fmt.Fprintln(stderr, "usage: wpress extract -o <dir> [flags] <archive.wpress>")
 		fs.PrintDefaults()
 		return 2
@@ -116,16 +136,15 @@ func cmdExtract(args []string, stdout, stderr io.Writer) int {
 		}
 	}
 
-	f, err := os.Open(fs.Arg(0))
+	f, err := os.Open(pos[0])
 	if err != nil {
-		fmt.Fprintln(stderr, "wpress:", err)
-		return 1
+		return fail(stdout, stderr, *asJSON, nil, 0, err)
 	}
 	defer f.Close()
 
-	opt := archive.Options{Exclude: excludes}
+	opt := archive.Options{Exclude: excludes, AllowMissingEOF: *allowTrunc}
 	var p *progress
-	if !*quiet {
+	if !*quiet && isTerminal(stderr) {
 		if fi, err := f.Stat(); err == nil {
 			p = newProgress(stderr, fi.Size())
 			opt.Progress = p.update
@@ -138,25 +157,52 @@ func cmdExtract(args []string, stdout, stderr io.Writer) int {
 		p.finish()
 	}
 	if err != nil {
-		fmt.Fprintln(stderr, "wpress:", err)
-		return 1
+		return fail(stdout, stderr, *asJSON, st, time.Since(start), err)
 	}
 	printStats(stdout, st, time.Since(start), *asJSON)
 	return 0
+}
+
+// fail reports err on stderr and, with -json, as {"error": ...} plus the
+// partial statistics on stdout.
+func fail(stdout, stderr io.Writer, asJSON bool, st *archive.Stats, d time.Duration, err error) int {
+	fmt.Fprintln(stderr, "wpress:", err)
+	if asJSON {
+		if st == nil {
+			st = &archive.Stats{}
+		}
+		_ = json.NewEncoder(stdout).Encode(struct {
+			Error string `json:"error"`
+			*archive.Stats
+			Seconds float64 `json:"seconds"`
+		}{err.Error(), st, d.Seconds()})
+	}
+	return 1
+}
+
+func isTerminal(w io.Writer) bool {
+	f, ok := w.(*os.File)
+	if !ok {
+		return false
+	}
+	fi, err := f.Stat()
+	return err == nil && fi.Mode()&os.ModeCharDevice != 0
 }
 
 func cmdList(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("list", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	asJSON := fs.Bool("json", false, "one JSON object per entry")
-	if err := fs.Parse(args); err != nil {
+	allowTrunc := fs.Bool("allow-missing-eof", false, "accept archives without end marker (probably truncated)")
+	pos, err := parseInterspersed(fs, args)
+	if err != nil {
 		return 2
 	}
-	if fs.NArg() != 1 {
+	if len(pos) != 1 {
 		fmt.Fprintln(stderr, "usage: wpress list [-json] <archive.wpress>")
 		return 2
 	}
-	f, err := os.Open(fs.Arg(0))
+	f, err := os.Open(pos[0])
 	if err != nil {
 		fmt.Fprintln(stderr, "wpress:", err)
 		return 1
@@ -178,13 +224,23 @@ func cmdList(args []string, stdout, stderr io.Writer) int {
 			_ = enc.Encode(map[string]any{"path": h.Path, "size": h.Size, "mtime": h.MTime})
 		} else {
 			fmt.Fprintf(stdout, "%14d  %s  %s\n", h.Size,
-				time.Unix(h.MTime, 0).UTC().Format("2006-01-02 15:04"), h.Path)
+				time.Unix(h.MTime, 0).UTC().Format("2006-01-02 15:04"), printable(h.Path))
 		}
 	}
-	if rd.MissingEOF {
-		fmt.Fprintln(stderr, "wpress: warning: archive has no end marker, it may be truncated")
+	if rd.MissingEOF && !*allowTrunc {
+		fmt.Fprintln(stderr, "wpress:", archive.ErrTruncated)
+		return 1
 	}
 	return 0
+}
+
+// printable quotes paths that are not plain printable UTF-8, so file names
+// from untrusted archives cannot inject terminal escape sequences.
+func printable(p string) string {
+	if strconv.CanBackquote(p) && !strings.ContainsRune(p, '`') {
+		return p
+	}
+	return strconv.Quote(p)
 }
 
 func printStats(w io.Writer, st *archive.Stats, d time.Duration, asJSON bool) {
@@ -199,8 +255,13 @@ func printStats(w io.Writer, st *archive.Stats, d time.Duration, asJSON bool) {
 	fmt.Fprintf(w, "extracted %d files (%s) in %s\n", st.Files, human(st.Bytes), d.Round(time.Second))
 	if st.SkippedFiles > 0 {
 		fmt.Fprintf(w, "skipped   %d files (%s)\n", st.SkippedFiles, human(st.SkippedBytes))
-		for pat, b := range st.SkippedBy {
-			fmt.Fprintf(w, "  %-28s %s\n", pat, human(b))
+		pats := make([]string, 0, len(st.SkippedBy))
+		for pat := range st.SkippedBy {
+			pats = append(pats, pat)
+		}
+		sort.Strings(pats)
+		for _, pat := range pats {
+			fmt.Fprintf(w, "  %-28s %s\n", pat, human(st.SkippedBy[pat]))
 		}
 	}
 	if st.MissingEOF {

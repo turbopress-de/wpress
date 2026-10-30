@@ -165,6 +165,10 @@ func TestSafePathRejects(t *testing.T) {
 		{".", ""},
 		{".", "."},
 		{".", "a\x00b"},
+		{".", "a\nb"},
+		{"x\ry", "a"},
+		{".", "\x1b[31mred"},
+		{".", "del\x7f"},
 	}
 	for _, b := range bad {
 		if p, err := SafePath(b.prefix, b.name); !errors.Is(err, ErrUnsafePath) {
@@ -207,15 +211,22 @@ func TestSymlinkInTargetNotFollowed(t *testing.T) {
 		t.Fatal(err)
 	}
 	raw := build([]entry{{"plugins", "x.php", []byte("x"), 1}}, true)
-	if _, err := Extract(NewReader(bytes.NewReader(raw)), dir, Options{}); !errors.Is(err, ErrUnsafePath) {
-		t.Fatalf("dir symlink: err = %v, want ErrUnsafePath", err)
-	}
-	raw = build([]entry{{".", "link.txt", []byte("x"), 1}}, true)
 	if _, err := Extract(NewReader(bytes.NewReader(raw)), dir, Options{}); err == nil {
-		t.Fatal("file symlink: expected error")
+		t.Fatal("dir symlink pointing outside: expected error")
+	}
+	if _, err := os.Stat(filepath.Join(outside, "x.php")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("wrote through directory symlink")
+	}
+	// A symlink at the target file name is replaced, not followed.
+	raw = build([]entry{{".", "link.txt", []byte("x"), 1}}, true)
+	if _, err := Extract(NewReader(bytes.NewReader(raw)), dir, Options{}); err != nil {
+		t.Fatalf("file symlink: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(outside, "f")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatal("wrote through symlink")
+	}
+	if fi, err := os.Lstat(filepath.Join(dir, "link.txt")); err != nil || !fi.Mode().IsRegular() {
+		t.Fatalf("link.txt not replaced by a regular file: %v", err)
 	}
 }
 
@@ -253,12 +264,14 @@ func TestTruncatedInsideSkippedEntry(t *testing.T) {
 }
 
 func TestMissingEOFMarker(t *testing.T) {
-	st, err := Extract(NewReader(bytes.NewReader(build(sample[:2], false))), t.TempDir(), Options{})
-	if err != nil {
-		t.Fatal(err)
+	raw := build(sample[:2], false)
+	st, err := Extract(NewReader(bytes.NewReader(raw)), t.TempDir(), Options{})
+	if !errors.Is(err, ErrTruncated) || !st.MissingEOF || st.Files != 2 {
+		t.Fatalf("err = %v, stats %+v", err, st)
 	}
-	if !st.MissingEOF || st.Files != 2 {
-		t.Fatalf("stats %+v", st)
+	st, err = Extract(NewReader(bytes.NewReader(raw)), t.TempDir(), Options{AllowMissingEOF: true})
+	if err != nil || !st.MissingEOF || st.Files != 2 {
+		t.Fatalf("allow: err = %v, stats %+v", err, st)
 	}
 }
 
@@ -309,5 +322,92 @@ func TestNewStyleEOFHeaderLengthMismatch(t *testing.T) {
 	_, err := Extract(NewReader(bytes.NewReader(raw)), t.TempDir(), Options{})
 	if err == nil || !strings.Contains(err.Error(), "damaged") {
 		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestDataAfterEndMarker(t *testing.T) {
+	body := build(sample[:2], false)
+	variants := map[string][]byte{
+		"nul-marker": append(build(sample[:2], true), []byte("rest of site")...),
+		"zero-gap":   append(build(sample[:2], true), build(sample[2:4], true)...),
+		"new-marker": append(append(append([]byte{}, body...), newEOF(len(body), "deadbeef")...), 0),
+	}
+	for name, raw := range variants {
+		for _, seekable := range []bool{true, false} {
+			var r io.Reader = bytes.NewReader(raw)
+			if !seekable {
+				r = io.MultiReader(r)
+			}
+			_, err := Extract(NewReader(r), t.TempDir(), Options{})
+			if err == nil || !strings.Contains(err.Error(), "after the end marker") {
+				t.Errorf("%s seekable=%v: err = %v", name, seekable, err)
+			}
+		}
+	}
+}
+
+func TestEncryptedArchive(t *testing.T) {
+	raw := build([]entry{
+		{".", "package.json", []byte(`{"Encrypted":true,"EncryptedSignature":"abc"}`), 1},
+		{".", "database.sql", []byte("garbage"), 1},
+	}, true)
+	if _, err := Extract(NewReader(bytes.NewReader(raw)), t.TempDir(), Options{}); !errors.Is(err, ErrEncrypted) {
+		t.Fatalf("err = %v, want ErrEncrypted", err)
+	}
+	// A signature alone (written by current plugin versions) is not encryption.
+	raw = build([]entry{{".", "package.json", []byte(`{"EncryptedSignature":"abc"}`), 1}}, true)
+	dir := t.TempDir()
+	if _, err := Extract(NewReader(bytes.NewReader(raw)), dir, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(filepath.Join(dir, "package.json")); string(b) != `{"EncryptedSignature":"abc"}` {
+		t.Fatalf("package.json content %q", b)
+	}
+}
+
+func TestHardLinkNotTruncated(t *testing.T) {
+	dir := t.TempDir()
+	outside := filepath.Join(t.TempDir(), "secret")
+	if err := os.WriteFile(outside, []byte("keep me"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(outside, filepath.Join(dir, "a.txt")); err != nil {
+		t.Skip("hard links unsupported:", err)
+	}
+	raw := build([]entry{{".", "a.txt", []byte("new"), 1}}, true)
+	if _, err := Extract(NewReader(bytes.NewReader(raw)), dir, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(outside); string(b) != "keep me" {
+		t.Fatalf("hard link target modified: %q", b)
+	}
+}
+
+func TestFileDirCollision(t *testing.T) {
+	raw := build([]entry{
+		{".", "x", []byte("file"), 1},
+		{"x", "y", []byte("in dir"), 1},
+	}, true)
+	if _, err := Extract(NewReader(bytes.NewReader(raw)), t.TempDir(), Options{}); err == nil {
+		t.Fatal("expected error for file/directory collision")
+	}
+}
+
+func TestDuplicateEntryOverwrites(t *testing.T) {
+	raw := build([]entry{{".", "a", []byte("first"), 1}, {".", "a", []byte("2nd"), 1}}, true)
+	dir := t.TempDir()
+	if _, err := Extract(NewReader(bytes.NewReader(raw)), dir, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(filepath.Join(dir, "a")); string(b) != "2nd" {
+		t.Fatalf("got %q", b)
+	}
+}
+
+func TestExcludePatternNormalised(t *testing.T) {
+	for _, pat := range []string{"./updraft", "updraft/", "/updraft//"} {
+		if _, ok := Excluded("updraft/a.zip", []string{pat}); !ok {
+			t.Errorf("pattern %q should exclude updraft/a.zip", pat)
+		}
 	}
 }

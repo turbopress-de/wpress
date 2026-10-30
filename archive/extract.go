@@ -1,12 +1,14 @@
 package archive
 
 import (
+	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path"
-	"path/filepath"
 	"strings"
 	"time"
 )
@@ -16,17 +18,27 @@ import (
 // was written to fix.
 const copyBufSize = 4 << 20
 
+// maxPackageJSON caps how much of package.json is buffered for inspection.
+const maxPackageJSON = 16 << 20
+
+// ErrEncrypted is returned for archives created with the encryption option
+// of the plugin. Their content cannot be extracted meaningfully.
+var ErrEncrypted = errors.New("archive is encrypted (package.json has \"Encrypted\": true), not supported")
+
 // Options control Extract.
 type Options struct {
 	// Exclude holds patterns in path.Match syntax. An entry is skipped if
 	// the pattern matches its path or any of its parent directories, so
 	// "updraft" skips everything below updraft/.
 	Exclude []string
+	// AllowMissingEOF accepts archives without end-of-file header instead
+	// of returning ErrTruncated.
+	AllowMissingEOF bool
 	// Progress, if set, is called after each entry with the archive offset.
 	Progress func(offset int64)
 }
 
-// Stats summarises an extraction or listing.
+// Stats summarises an extraction.
 type Stats struct {
 	Files        int64            `json:"files"`
 	Bytes        int64            `json:"bytes"`
@@ -37,16 +49,24 @@ type Stats struct {
 	Checksum     string           `json:"crc32,omitempty"`
 }
 
+func normPattern(p string) string {
+	p = strings.Trim(p, "/")
+	if p == "" {
+		return ""
+	}
+	return path.Clean(p)
+}
+
 // Excluded reports which pattern, if any, excludes p.
 func Excluded(p string, patterns []string) (string, bool) {
-	for _, pat := range patterns {
-		pat = strings.Trim(pat, "/")
-		if pat == "" {
+	for _, raw := range patterns {
+		pat := normPattern(raw)
+		if pat == "" || pat == "." {
 			continue
 		}
 		for d := p; d != "." && d != "/" && d != ""; d = path.Dir(d) {
 			if ok, _ := path.Match(pat, d); ok {
-				return pat, true
+				return raw, true
 			}
 		}
 	}
@@ -56,7 +76,7 @@ func Excluded(p string, patterns []string) (string, bool) {
 // ValidatePatterns checks exclude patterns for syntax errors.
 func ValidatePatterns(patterns []string) error {
 	for _, p := range patterns {
-		if _, err := path.Match(p, ""); err != nil {
+		if _, err := path.Match(normPattern(p), ""); err != nil {
 			return fmt.Errorf("invalid exclude pattern %q: %w", p, err)
 		}
 	}
@@ -64,19 +84,28 @@ func ValidatePatterns(patterns []string) error {
 }
 
 // Extract writes all entries of rd below dir. dir is created if missing.
+// All file system access goes through an os.Root, so neither archive paths
+// nor symlinks already present in dir can reach outside of it.
+// On error the returned Stats describe what was extracted so far.
 func Extract(rd *Reader, dir string, opt Options) (*Stats, error) {
+	st := &Stats{SkippedBy: map[string]int64{}}
+	defer func() {
+		if len(st.SkippedBy) == 0 {
+			st.SkippedBy = nil
+		}
+	}()
 	if err := ValidatePatterns(opt.Exclude); err != nil {
-		return nil, err
+		return st, err
 	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return nil, err
+		return st, err
 	}
-	root, err := filepath.Abs(dir)
+	root, err := os.OpenRoot(dir)
 	if err != nil {
-		return nil, err
+		return st, err
 	}
+	defer root.Close()
 
-	st := &Stats{SkippedBy: map[string]int64{}}
 	buf := make([]byte, copyBufSize)
 	for {
 		h, err := rd.Next()
@@ -97,7 +126,19 @@ func Extract(rd *Reader, dir string, opt Options) (*Stats, error) {
 			continue
 		}
 
-		if err := writeEntry(rd, h, root, buf); err != nil {
+		var src io.Reader = rd
+		if h.Path == "package.json" && h.Size <= maxPackageJSON {
+			b, err := io.ReadAll(rd)
+			if err != nil {
+				return st, fmt.Errorf("%s: %w", h.Path, err)
+			}
+			if encrypted(b) {
+				return st, ErrEncrypted
+			}
+			src = bytes.NewReader(b)
+		}
+
+		if err := writeEntry(root, h, src, buf); err != nil {
 			return st, err
 		}
 		st.Files++
@@ -108,31 +149,35 @@ func Extract(rd *Reader, dir string, opt Options) (*Stats, error) {
 	}
 	st.MissingEOF = rd.MissingEOF
 	st.Checksum = rd.Checksum
-	if len(st.SkippedBy) == 0 {
-		st.SkippedBy = nil
+	if st.MissingEOF && !opt.AllowMissingEOF {
+		return st, ErrTruncated
 	}
 	return st, nil
 }
 
-func writeEntry(rd *Reader, h *Header, root string, buf []byte) error {
-	target := filepath.Join(root, filepath.FromSlash(h.Path))
-	// Defence in depth: SafePath already rejected "..", but verify the
-	// joined result is still below root.
-	if rel, err := filepath.Rel(root, target); err != nil || rel == ".." ||
-		strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-		return fmt.Errorf("%w: %q", ErrUnsafePath, h.Path)
+func encrypted(packageJSON []byte) bool {
+	var cfg struct {
+		Encrypted bool `json:"Encrypted"`
 	}
-	if err := mkdirNoSymlink(root, filepath.Dir(target)); err != nil {
+	return json.Unmarshal(packageJSON, &cfg) == nil && cfg.Encrypted
+}
+
+func writeEntry(root *os.Root, h *Header, src io.Reader, buf []byte) error {
+	if dir := path.Dir(h.Path); dir != "." {
+		if err := root.MkdirAll(dir, 0o755); err != nil {
+			return fmt.Errorf("%s: %w", h.Path, err)
+		}
+	}
+	// Remove whatever exists first and create exclusively: never truncate
+	// through an existing hard link, never block on a FIFO.
+	if err := root.Remove(h.Path); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return fmt.Errorf("%s: %w", h.Path, err)
 	}
-
-	// O_NOFOLLOW: never write through a symlink that might already exist
-	// in the target directory.
-	f, err := os.OpenFile(target, os.O_WRONLY|os.O_CREATE|os.O_TRUNC|oNoFollow, 0o644)
+	f, err := root.OpenFile(h.Path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
 	if err != nil {
 		return fmt.Errorf("%s: %w", h.Path, err)
 	}
-	n, err := io.CopyBuffer(f, onlyReader{rd}, buf)
+	n, err := io.CopyBuffer(f, onlyReader{src}, buf)
 	if cerr := f.Close(); err == nil {
 		err = cerr
 	}
@@ -144,42 +189,12 @@ func writeEntry(rd *Reader, h *Header, root string, buf []byte) error {
 	}
 	if h.MTime > 0 {
 		t := time.Unix(h.MTime, 0)
-		_ = os.Chtimes(target, t, t)
+		_ = root.Chtimes(h.Path, t, t)
 	}
 	return nil
 }
 
-// mkdirNoSymlink creates dir (below root) and refuses to traverse existing
-// symlinks, so a pre-existing link cannot redirect writes outside root.
-func mkdirNoSymlink(root, dir string) error {
-	rel, err := filepath.Rel(root, dir)
-	if err != nil {
-		return err
-	}
-	if rel == "." {
-		return nil
-	}
-	cur := root
-	for _, seg := range strings.Split(rel, string(filepath.Separator)) {
-		cur = filepath.Join(cur, seg)
-		fi, err := os.Lstat(cur)
-		switch {
-		case errors.Is(err, os.ErrNotExist):
-			if err := os.Mkdir(cur, 0o755); err != nil && !errors.Is(err, os.ErrExist) {
-				return err
-			}
-		case err != nil:
-			return err
-		case fi.Mode()&os.ModeSymlink != 0:
-			return fmt.Errorf("%w: symlink in path %q", ErrUnsafePath, cur)
-		case !fi.IsDir():
-			return fmt.Errorf("%q exists and is not a directory", cur)
-		}
-	}
-	return nil
-}
-
-// onlyReader hides Reader's other methods so io.CopyBuffer uses buf.
+// onlyReader hides other methods (WriterTo) so io.CopyBuffer uses buf.
 type onlyReader struct{ r io.Reader }
 
 func (o onlyReader) Read(p []byte) (int, error) { return o.r.Read(p) }

@@ -23,12 +23,16 @@ for the archive above; `wpress` copies in 4 MiB blocks and runs at disk speed.
   backup plugins (UpdraftPlus, Duplicator, BackWPup, WPvivid, ...). Sites often
   carry several times their own size in old backups. `-exclude` adds your own
   patterns.
-- **Safe on untrusted input**: rejects absolute paths, `..` components and NUL
-  bytes, never follows symlinks in the target directory, detects truncated
-  archives (including the length check in the end header of newer plugin
-  versions).
-- **Scriptable**: `-json` summary, `list -json` with one object per entry,
-  non-zero exit code on any error.
+- **Safe on untrusted input**: rejects absolute paths, `..` components and
+  control characters; all writes go through Go's
+  [`os.Root`](https://pkg.go.dev/os#Root), so neither archive paths nor
+  symlinks in the target directory can reach outside of it; existing files
+  are replaced, never truncated through hard links.
+- **Detects damaged archives**: missing end marker, truncated entries,
+  data after the end marker, and the length stored in the end header of newer
+  plugin versions. Encrypted archives are refused instead of producing garbage.
+- **Scriptable**: `-json` summary (also on errors, with an `error` field),
+  `list -json` with one object per entry, non-zero exit code on any error.
 
 ## Install
 
@@ -36,7 +40,7 @@ Download a binary from the [releases](https://github.com/turbopress-de/wpress/re
 (Linux, macOS, Windows; amd64 and arm64) or build from source:
 
 ```bash
-go install github.com/turbopress-de/wpress/cmd/wpress@latest
+go install github.com/turbopress-de/wpress/cmd/wpress@latest   # Go 1.25+
 ```
 
 ## Usage
@@ -56,7 +60,15 @@ wpress list backup.wpress
 wpress list -json backup.wpress | jq -r 'select(.size > 100000000) | .path'
 ```
 
-`extract` refuses a non-empty output directory unless `-force` is given.
+`extract` refuses a non-empty output directory unless `-force` is given; with
+`-force`, files in the way are replaced. Flags may come before or after the
+archive name. A progress line is shown only when stderr is a terminal.
+
+Archives without an end marker are treated as truncated and fail with exit
+code 1; `-allow-missing-eof` extracts them anyway.
+
+Exit codes: `0` success, `1` error (damaged archive, I/O error, ...), `2`
+invalid usage.
 
 ### Exclude patterns
 
@@ -82,9 +94,10 @@ uploads/backupbuddy_backups  backupwordpress-*  uploads/backupwordpress-*
  "skipped_bytes_by_pattern":{"updraft":20054850356},"crc32":"69a8404c","seconds":10.28}
 ```
 
-`missing_eof_marker: true` means the archive ended without an end header and
-may be incomplete. `crc32` is the checksum stored by the plugin; it is
-reported, not verified.
+On failure the object additionally has an `error` field and the counters
+describe what was extracted before the error. `missing_eof_marker: true`
+appears with `-allow-missing-eof` when the archive had no end header. `crc32`
+is the checksum stored by the plugin; it is reported, not verified.
 
 ## File format
 
@@ -102,7 +115,12 @@ The archive ends with a header that is either all NUL bytes (older plugin
 versions) or has an empty name, the archive length in the size field and a
 CRC32 checksum in the last bytes (newer versions).
 
-Encrypted archives (a feature of a paid plugin extension) are not supported.
+Encrypted archives (`"Encrypted": true` in `package.json`) are not supported
+and fail with an error.
+
+Patterns and paths are case-sensitive. File names that are not valid UTF-8
+are extracted byte for byte; `list -json` shows them with U+FFFD replacement
+characters.
 
 ## Library
 

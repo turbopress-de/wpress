@@ -1,3 +1,3 @@
 module github.com/turbopress-de/wpress
 
-go 1.22
+go 1.25

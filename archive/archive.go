@@ -35,6 +35,10 @@ const (
 	HeaderSize = nameLen + sizeLen + mtimeLen + prefixLen
 )
 
+// ErrTruncated is returned when the archive ends without an end-of-file
+// header, i.e. it is probably incomplete.
+var ErrTruncated = errors.New("archive has no end marker, it is probably truncated")
+
 // ErrUnsafePath is returned for entries whose path would leave the
 // extraction directory (absolute paths, ".." components, NUL bytes).
 var ErrUnsafePath = errors.New("unsafe path in archive")
@@ -97,7 +101,7 @@ func (rd *Reader) Next() (*Header, error) {
 		return nil, io.EOF
 	}
 	if err := rd.skip(rd.remaining); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("entry content ending at offset %d: %w", rd.offset+rd.remaining, err)
 	}
 	rd.remaining = 0
 
@@ -118,7 +122,7 @@ func (rd *Reader) Next() (*Header, error) {
 
 	if allZero(rd.buf[:]) {
 		rd.done = true
-		return nil, io.EOF
+		return nil, rd.checkTrailing()
 	}
 	if field(rd.buf[:nameLen]) == "" {
 		// End-of-file header of newer plugin versions.
@@ -133,7 +137,7 @@ func (rd *Reader) Next() (*Header, error) {
 			}
 		}
 		rd.Checksum = strings.TrimSpace(field(bytes.TrimLeft(rd.buf[nameLen+sizeLen+mtimeLen:], "\x00")))
-		return nil, io.EOF
+		return nil, rd.checkTrailing()
 	}
 
 	h, err := parseHeader(rd.buf[:])
@@ -143,6 +147,23 @@ func (rd *Reader) Next() (*Header, error) {
 	h.Offset = start
 	rd.remaining = h.Size
 	return h, nil
+}
+
+// checkTrailing makes sure nothing follows the end header. A zero-filled
+// gap (preallocated or partially written file) would otherwise look like a
+// complete archive.
+func (rd *Reader) checkTrailing() error {
+	if rd.seeker != nil {
+		if extra := rd.size - rd.offset; extra > 0 {
+			return fmt.Errorf("%d bytes of data after the end marker at offset %d: archive is damaged", extra, rd.offset-HeaderSize)
+		}
+		return io.EOF
+	}
+	var b [1]byte
+	if n, _ := io.ReadFull(rd.r, b[:]); n > 0 {
+		return fmt.Errorf("data after the end marker at offset %d: archive is damaged", rd.offset-HeaderSize)
+	}
+	return io.EOF
 }
 
 // Read reads content of the current entry.
@@ -221,8 +242,10 @@ func SafePath(prefix, name string) (string, error) {
 	if prefix != "" {
 		joined = prefix + "/" + name
 	}
-	if strings.IndexByte(joined, 0) >= 0 {
-		return "", fmt.Errorf("%w: NUL byte", ErrUnsafePath)
+	for _, c := range []byte(joined) {
+		if c < 0x20 || c == 0x7f {
+			return "", fmt.Errorf("%w: control character in %q", ErrUnsafePath, joined)
+		}
 	}
 	if strings.HasPrefix(prefix, "/") || strings.HasPrefix(name, "/") ||
 		hasDriveLetter(prefix) || hasDriveLetter(name) {
